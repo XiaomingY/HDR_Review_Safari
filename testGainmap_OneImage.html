@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU HDR Gain Map Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #222;
+            color: white;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        canvas {
+            width: 100%;
+            max-width: 800px;
+            height: auto;
+            border: 1px solid #444;
+            display: block;
+            margin: 20px auto;
+        }
+        
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        .slider-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .slider {
+            width: 300px;
+            height: 6px;
+            border-radius: 3px;
+            background: #444;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #007bff;
+            cursor: pointer;
+        }
+        
+        .slider::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #007bff;
+            cursor: pointer;
+            border: none;
+        }
+        
+        .value-display {
+            font-weight: bold;
+            color: #007bff;
+            min-width: 60px;
+        }
+        
+        .file-input {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .warning {
+            background: #664400;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            display: none;
+        }
+        
+        .info {
+            background: #004466;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebGPU HDR Gain Map Viewer</h1>
+        
+        <div class="warning" id="hdr-warning">
+            ⚠️ HDR display not detected. You'll see a simulation of the gain map effect, but not true HDR.
+        </div>
+        
+        <div class="info">
+            <strong>Instructions:</strong> An HDR JPEG with a gain map is pre-loaded. Use the slider to control the gain map intensity:
+            <br>• 0% = Off
+            <br>• 100% = Full Itensity
+        </div>
+        
+        <canvas id="canvas" width="800" height="600"></canvas>
+        
+        <div class="controls">
+            <div style="margin-bottom: 10px;">
+                <input type="checkbox" id="useGainMapToggle" checked>
+                <label for="useGainMapToggle">Use Gain Map</label>
+            </div>
+            <div class="slider-container">
+                <span>Off</span>
+                <input type="range" id="gainSlider" class="slider" min="0" max="100" value="100" />
+                <span>100%</span>
+            </div>
+            <div class="value-display">
+                Dimming Level: <span id="sliderValue">100%</span>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import {
+          makeShaderDataDefinitions,
+          makeStructuredView,
+        } from 'https://greggman.github.io/webgpu-utils/dist/1.x/webgpu-utils.module.js';
+
+        class WebGPUGainMapViewer {
+            constructor() {
+                this.device = null;
+                this.context = null;
+                this.renderPipeline = null;
+                this.baseTexture = null;
+                this.gainTexture = null;
+                this.uniformBuffer = null;
+                this.baseBitmap = null;
+                this.gainBitmap = null;
+                this.bindGroup = null;
+                this.isHDRSupported = false;
+                
+                this.gainMapParams = {
+                    ratioMin: [1.0, 1.0, 1.0],
+                    ratioMax: [4.0, 4.0, 4.0],
+                    gamma: [1.0, 1.0, 1.0],
+                    epsilonSdr: [0.015625, 0.015625, 0.015625],
+                    epsilonHdr: [0.015625, 0.015625, 0.015625],
+                    displayRatioForFullHdr: 4.0,
+                    minDisplayRatioForHdrTransition: 1.0,
+                    weight: 1.0,
+                    dimming: 1.0
+                };
+                this.init();
+            }
+
+            async init() {
+                try {
+                    await this.initWebGPU();
+                    this.setupEventListeners();
+                    this.checkHDRSupport();
+                    await this.loadInitialImages();
+                } catch (error) {
+                    console.error('Failed to initialize WebGPU:', error);
+                }
+            }
+
+            async initWebGPU() {
+                // Check WebGPU support
+                if (!navigator.gpu) {
+                    throw new Error('WebGPU not supported');
+                }
+
+                // Request adapter and device
+                const adapter = await navigator.gpu.requestAdapter();
+                if (!adapter) {
+                    throw new Error('No WebGPU adapter found');
+                }
+
+                this.device = await adapter.requestDevice();
+                
+                // Get canvas context
+                const canvas = document.getElementById('canvas');
+                this.context = canvas.getContext('webgpu');
+                
+                // Configure context for HDR
+                this.context.configure({
+                    device: this.device,
+                    format: 'rgba16float',
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                    toneMapping: { mode: 'extended' }
+                });
+
+                this.createShaders();
+                this.createBuffers();
+            }
+
+            createShaders() {
+                this.code = `
+                        struct VertexOutput {
+                            @builtin(position) position: vec4<f32>,
+                            @location(0) texCoord: vec2<f32>,
+                        }
+
+                        @vertex
+                        fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+                            var pos = array<vec2<f32>, 6>(
+                                vec2<f32>(-1.0, -1.0),
+                                vec2<f32>( 1.0, -1.0),
+                                vec2<f32>(-1.0,  1.0),
+                                vec2<f32>(-1.0,  1.0),
+                                vec2<f32>( 1.0, -1.0),
+                                vec2<f32>( 1.0,  1.0)
+                            );
+                            
+                            var texCoord = array<vec2<f32>, 6>(
+                                vec2<f32>(0.0, 1.0), // For pos(-1.0, -1.0) -> bottom-left of screen, map to texture's bottom-left
+                                vec2<f32>(1.0, 1.0), // For pos( 1.0, -1.0) -> bottom-right of screen, map to texture's bottom-right
+                                vec2<f32>(0.0, 0.0), // For pos(-1.0,  1.0) -> top-left of screen, map to texture's top-left
+                                vec2<f32>(0.0, 0.0), // For pos(-1.0,  1.0) -> top-left of screen, map to texture's top-left
+                                vec2<f32>(1.0, 1.0), // For pos( 1.0, -1.0) -> bottom-right of screen, map to texture's bottom-right
+                                vec2<f32>(1.0, 0.0)  // For pos( 1.0,  1.0) -> top-right of screen, map to texture's top-right
+                            );
+
+                            var output: VertexOutput;
+                            output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+                            output.texCoord = texCoord[vertexIndex];
+                            return output;
+                        }
+
+                        struct GainMapParams {
+                            ratioMin: vec3<f32>,
+                            ratioMax: vec3<f32>,
+                            gamma: vec3<f32>,
+                            epsilonSdr: vec3<f32>,
+                            epsilonHdr: vec3<f32>,
+                            displayRatioForFullHdr: f32,
+                            minDisplayRatioForHdrTransition: f32,
+                            weight: f32,
+                            dimming: f32,
+                        }
+
+                        
+                        @group(0) @binding(0) var baseSampler: sampler;
+                        @group(0) @binding(1) var baseTexture: texture_2d<f32>;
+                        @group(0) @binding(2) var gainSampler: sampler;
+                        @group(0) @binding(3) var gainTexture: texture_2d<f32>;
+                        @group(0) @binding(4) var<uniform> params: GainMapParams;
+
+                        @fragment
+                        fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+                            let baseColor = textureSample(baseTexture, baseSampler, input.texCoord);
+                            let gainValue = textureSample(gainTexture, gainSampler, input.texCoord);
+                            
+                            // Apply gain map formula based on Android documentation
+                            let W = params.weight; // Apply slider control directly
+                            
+                            let logRatioMin = log(params.ratioMin);
+                            let logRatioMax = log(params.ratioMax);
+                            let powGain = pow(gainValue.rgb, params.gamma);
+                            let L = mix(logRatioMin, logRatioMax, powGain);
+                            
+                            let result = ((baseColor.rgb + params.epsilonSdr) * exp(L * W) - params.epsilonHdr)*params.dimming;
+                            
+                            return vec4<f32>(result, baseColor.a);
+                        }
+                    `;
+                const shaderModule = this.device.createShaderModule({code: this.code});
+                this.shaderDefs = makeShaderDataDefinitions(this.code);
+                this.renderPipeline = this.device.createRenderPipeline({
+                    layout: 'auto',
+                    vertex: {
+                        module: shaderModule,
+                        entryPoint: 'vertexMain',
+                    },
+                    fragment: {
+                        module: shaderModule,
+                        entryPoint: 'fragmentMain',
+                        targets: [{
+                            format: 'rgba16float',
+                        }],
+                    },
+                    primitive: {
+                        topology: 'triangle-list',
+                    },
+                });
+            }
+
+            createBuffers() {
+                // Create uniform buffer for gain map parameters
+                this.uniforms = makeStructuredView(this.shaderDefs.uniforms.params);
+                this.uniformBuffer = this.device.createBuffer({
+                    size: this.uniforms.arrayBuffer.byteLength,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                });
+
+                // Create samplers
+                this.sampler = this.device.createSampler({
+                    magFilter: 'linear',
+                    minFilter: 'linear',
+                });
+            }
+
+            async loadInitialImages() {
+                try {
+                    const [sdrResponse, gainMapResponse] = await Promise.all([
+                        fetch('img/mirrored_hall_1k.jpg'),
+                        fetch('img/mirrored_hall_1k-gainmap.jpg')
+                    ]);
+
+                    if (!sdrResponse.ok) throw new Error(`HTTP error! status: ${sdrResponse.status} for SDR image`);
+                    if (!gainMapResponse.ok) throw new Error(`HTTP error! status: ${gainMapResponse.status} for gain map`);
+
+                    const [sdrBlob, gainMapBlob] = await Promise.all([
+                        sdrResponse.blob(),
+                        gainMapResponse.blob()
+                    ]);
+
+                    [this.baseBitmap, this.gainBitmap] = await Promise.all([
+                        createImageBitmap(sdrBlob, { colorSpaceConversion: 'none' }),
+                        createImageBitmap(gainMapBlob, { colorSpaceConversion: 'none' })
+                    ]);
+
+                    if (this.baseBitmap.width !== this.gainBitmap.width || this.baseBitmap.height !== this.gainBitmap.height) {
+                        alert('Base image and gain map must have the same dimensions.');
+                        return;
+                    }
+
+                    await this.createTexturesFromBitmaps();
+                    this.handleControlsChange();
+                } catch (error) {
+                    console.error('Failed to load initial images:', error);
+                    const canvas = document.getElementById('canvas');
+                    const p = document.createElement('p');
+                    p.style.color = 'red';
+                    p.textContent = 'Failed to load images. Make sure img/NC004-Downlight copy.jpg and img/NC004-Downlight copy-gainmap.jpg exist and you are running a local web server.';
+                    canvas.parentElement.insertBefore(p, canvas);
+                }
+            }
+
+            async createPlaceholderImage(width, height, text) {
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                
+                // Create gradient background
+                const gradient = ctx.createLinearGradient(0, 0, width, height);
+                gradient.addColorStop(0, '#ff6b6b');
+                gradient.addColorStop(0.5, '#4ecdc4');
+                gradient.addColorStop(1, '#45b7d1');
+                
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, width, height);
+                
+                // Add text
+                ctx.fillStyle = 'white';
+                ctx.font = '48px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, width / 2, height / 2);
+                
+                return createImageBitmap(canvas);
+            }
+
+            async createTexturesFromBitmaps() {
+                const canvas = document.getElementById('canvas');
+                canvas.width = this.baseBitmap.width;
+                canvas.height = this.baseBitmap.height;
+
+                // Create base texture
+                this.baseTexture = this.device.createTexture({
+                    size: [this.baseBitmap.width, this.baseBitmap.height],
+                    format: 'rgba16float',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                });
+
+                this.device.queue.copyExternalImageToTexture(
+                    { source: this.baseBitmap },
+                    { texture: this.baseTexture },
+                    { width: this.baseBitmap.width, height: this.baseBitmap.height }
+                );
+
+                // Create gain map texture
+                this.gainTexture = this.device.createTexture({
+                    size: [this.gainBitmap.width, this.gainBitmap.height],
+                    format: 'rgba8unorm',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                });
+                this.device.queue.copyExternalImageToTexture(
+                    { source: this.gainBitmap },
+                    { texture: this.gainTexture },
+                    { width: this.gainBitmap.width, height: this.gainBitmap.height }
+                );
+
+                // Create bind group
+                this.bindGroup = this.device.createBindGroup({
+                    layout: this.renderPipeline.getBindGroupLayout(0),
+                    entries: [                        
+                        { binding: 0, resource: this.sampler },
+                        { binding: 1, resource: this.baseTexture.createView() },
+                        { binding: 2, resource: this.sampler },
+                        { binding: 3, resource: this.gainTexture.createView() },
+                        { binding: 4, resource: { buffer: this.uniformBuffer } },
+                    ],
+                });
+            }
+
+            updateUniforms() {
+                console.log("weight: " + this.gainMapParams.weight);
+                this.uniforms.set({
+                    ratioMin: this.gainMapParams.ratioMin,
+                    ratioMax: this.gainMapParams.ratioMax,
+                    gamma: this.gainMapParams.gamma,
+                    epsilonSdr: this.gainMapParams.epsilonSdr,
+                    epsilonHdr: this.gainMapParams.epsilonHdr,
+                    displayRatioForFullHdr: this.gainMapParams.displayRatioForFullHdr,
+                    minDisplayRatioForHdrTransition: this.gainMapParams.minDisplayRatioForHdrTransition,
+                    weight: this.gainMapParams.weight,
+                    dimming: this.gainMapParams.dimming,
+                });
+
+                this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniforms.arrayBuffer);
+            }
+
+            render() {
+                if (!this.bindGroup) return;
+
+                const renderPassDescriptor = {
+                    colorAttachments: [
+                    {
+                        view: this.context.getCurrentTexture().createView(),
+                        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                    },
+                    ],
+                };
+                const commandEncoder = this.device.createCommandEncoder();
+
+                const renderPass = commandEncoder.beginRenderPass(renderPassDescriptor);
+
+                // Update uniforms right before drawing
+                this.updateUniforms();
+                
+                renderPass.setPipeline(this.renderPipeline);
+                renderPass.setBindGroup(0, this.bindGroup);
+                renderPass.draw(6, 1, 0, 0);
+                renderPass.end();
+
+                this.device.queue.submit([commandEncoder.finish()]);
+            }
+
+            handleControlsChange() {
+                const useGainMapToggle = document.getElementById('useGainMapToggle');
+                const gainSlider = document.getElementById('gainSlider');
+                const sliderValue = document.getElementById('sliderValue');
+
+                const useGainMap = useGainMapToggle.checked;
+                gainSlider.disabled = !useGainMap;
+
+                if (useGainMap) {
+                    const intensity = parseInt(gainSlider.value);
+                    sliderValue.textContent = intensity + '%';
+                    this.gainMapParams.dimming = intensity / 100.0;
+                    this.gainMapParams.weight = 1.0;
+                } else {
+                    sliderValue.textContent = 'Off';
+                    this.gainMapParams.dimming = 1.0;
+                    this.gainMapParams.weight = 0.0;
+                }
+
+                this.render();
+            }
+
+            checkHDRSupport() {
+                this.isHDRSupported = window.matchMedia('(dynamic-range: high)').matches;
+                
+                if (!this.isHDRSupported) {
+                    document.getElementById('hdr-warning').style.display = 'block';
+                }
+            }
+
+            setupEventListeners() {
+                const gainSlider = document.getElementById('gainSlider');
+                const useGainMapToggle = document.getElementById('useGainMapToggle');
+
+                gainSlider.addEventListener('input', () => this.handleControlsChange());
+                useGainMapToggle.addEventListener('change', () => this.handleControlsChange());
+            }
+        }
+
+        // Initialize the viewer when the page loads
+        window.addEventListener('DOMContentLoaded', () => {
+            new WebGPUGainMapViewer();
+        });
+    </script>
+</body>
+</html>
