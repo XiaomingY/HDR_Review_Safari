@@ -14,13 +14,13 @@
         }
         
         .container {
-            max-width: 1200px;
+            max-width: 3840px;
             margin: 0 auto;
         }
         
         canvas {
             width: 100%;
-            max-width: 800px;
+            max-width: 3840px;
             height: auto;
             border: 1px solid #444;
             display: block;
@@ -109,7 +109,7 @@
             <br>• 100% = Full Itensity
         </div>
         
-        <canvas id="canvas" width="800" height="600"></canvas>
+        <canvas id="canvas" width="1920" height="1080"></canvas>
         
         <div class="controls">
             <div style="margin-bottom: 10px;">
@@ -310,8 +310,8 @@
             async loadInitialImages() {
                 try {
                     const [sdrResponse, gainMapResponse] = await Promise.all([
-                        fetch('img/metro_noord_1k.jpg'),
-                        fetch('img/metro_noord_1k-gainmap.jpg')
+                        fetch('img/palermo_park_1k_SDR.jpg'),
+                        fetch('img/palermo_park_1k-gainmap.jpg')
                     ]);
 
                     if (!sdrResponse.ok) throw new Error(`HTTP error! status: ${sdrResponse.status} for SDR image`);

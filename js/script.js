@@ -5,6 +5,7 @@ const imageUrls = [
     'img/rochetta-pixel-ultrahdr.jpg',
     'img/iceberg-hdr.avif',
     'img/iceberg-sdr.jpg',
+    'img/metro_noord_1k_HDR.jpg',
     // e.g., 'img/my-awesome-photo.jpg',
 ];
 // ------------------------
