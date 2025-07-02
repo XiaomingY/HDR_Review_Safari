@@ -310,8 +310,8 @@
             async loadInitialImages() {
                 try {
                     const [sdrResponse, gainMapResponse] = await Promise.all([
-                        fetch('img/mirrored_hall_1k.jpg'),
-                        fetch('img/mirrored_hall_1k-gainmap.jpg')
+                        fetch('img/metro_noord_1k.jpg'),
+                        fetch('img/metro_noord_1k-gainmap.jpg')
                     ]);
 
                     if (!sdrResponse.ok) throw new Error(`HTTP error! status: ${sdrResponse.status} for SDR image`);
